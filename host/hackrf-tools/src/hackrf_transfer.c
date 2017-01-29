@@ -20,6 +20,7 @@
  * Boston, MA 02110-1301, USA.
  */
 
+
 #include <hackrf.h>
 
 #include <stdio.h>
@@ -32,6 +33,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+
+#define _FILE_OFFSET_BITS 64
 
 #ifndef bool
 typedef int bool;
@@ -82,16 +85,16 @@ int gettimeofday(struct timeval *tv, void* ignored)
 
 #define FD_BUFFER_SIZE (8*1024)
 
-#define FREQ_ONE_MHZ (1000000ull)
+#define FREQ_ONE_MHZ (1000000ll)
 
-#define DEFAULT_FREQ_HZ (900000000ull) /* 900MHz */
+#define DEFAULT_FREQ_HZ (900000000ll) /* 900MHz */
 #define FREQ_MIN_HZ	(0ull) /* 0 Hz */
-#define FREQ_MAX_HZ	(7250000000ull) /* 7250MHz */
-#define IF_MIN_HZ (2150000000ull)
-#define IF_MAX_HZ (2750000000ull)
-#define LO_MIN_HZ (84375000ull)
-#define LO_MAX_HZ (5400000000ull)
-#define DEFAULT_LO_HZ (1000000000ull)
+#define FREQ_MAX_HZ	(7250000000ll) /* 7250MHz */
+#define IF_MIN_HZ (2150000000ll)
+#define IF_MAX_HZ (2750000000ll)
+#define LO_MIN_HZ (84375000ll)
+#define LO_MAX_HZ (5400000000ll)
+#define DEFAULT_LO_HZ (1000000000ll)
 
 #define DEFAULT_SAMPLE_RATE_HZ (10000000) /* 10MHz default sample rate */
 
@@ -105,6 +108,18 @@ int gettimeofday(struct timeval *tv, void* ignored)
 #if defined _WIN32
 	#define sleep(a) Sleep( (a*1000) )
 #endif
+
+typedef enum {
+        TRANSCEIVER_MODE_OFF = 0,
+        TRANSCEIVER_MODE_RX = 1,
+        TRANSCEIVER_MODE_TX = 2,
+        TRANSCEIVER_MODE_SS = 3,
+} transceiver_mode_t;
+
+typedef enum {
+	HW_SYNC_MODE_OFF = 0,
+	HW_SYNC_MODE_ON = 1,
+} hw_sync_mode_t;
 
 /* WAVE or RIFF WAVE file format containing IQ 2x8bits data for HackRF compatible with SDR# Wav IQ file */
 typedef struct 
@@ -287,7 +302,7 @@ char* u64toa(uint64_t val, t_u64toa* str)
 	return res;
 }
 
-volatile bool do_exit = false;
+static volatile bool do_exit = false;
 
 FILE* fd = NULL;
 volatile uint32_t byte_count = 0;
@@ -295,21 +310,28 @@ volatile uint32_t byte_count = 0;
 bool signalsource = false;
 uint32_t amplitude = 0;
 
+bool hw_sync = false;
+
 bool receive = false;
 bool receive_wav = false;
+uint64_t stream_size = 0;
+uint32_t stream_head = 0;
+uint32_t stream_tail = 0;
+uint32_t stream_drop = 0;
+uint8_t *stream_buf = NULL;
 
 bool transmit = false;
 struct timeval time_start;
 struct timeval t_start;
 
 bool automatic_tuning = false;
-uint64_t freq_hz;
+int64_t freq_hz;
 
 bool if_freq = false;
-uint64_t if_freq_hz;
+int64_t if_freq_hz;
 
 bool lo_freq = false;
-uint64_t lo_freq_hz = DEFAULT_LO_HZ;
+int64_t lo_freq_hz = DEFAULT_LO_HZ;
 
 bool image_reject = false;
 uint32_t image_reject_selection;
@@ -332,13 +354,16 @@ uint32_t baseband_filter_bw_hz = 0;
 
 bool repeat = false;
 
+bool crystal_correct = false;
+uint32_t crystal_correct_ppm ;
+
 int rx_callback(hackrf_transfer* transfer) {
 	size_t bytes_to_write;
-	int i;
+	size_t bytes_written;
+	unsigned int i;
 
 	if( fd != NULL ) 
 	{
-		ssize_t bytes_written;
 		byte_count += transfer->valid_length;
 		bytes_to_write = transfer->valid_length;
 		if (limit_num_samples) {
@@ -353,12 +378,29 @@ int rx_callback(hackrf_transfer* transfer) {
 				transfer->buffer[i] ^= (uint8_t)0x80;
 			}
 		}
-		bytes_written = fwrite(transfer->buffer, 1, bytes_to_write, fd);
-		if ((bytes_written != bytes_to_write)
-				|| (limit_num_samples && (bytes_to_xfer == 0))) {
-			return -1;
+		if (stream_size>0){
+#ifndef _WIN32
+		    if ((stream_size-1+stream_head-stream_tail)%stream_size <bytes_to_write) {
+				stream_drop++;
+		    } else {
+				if(stream_tail+bytes_to_write <= stream_size) {
+				    memcpy(stream_buf+stream_tail,transfer->buffer,bytes_to_write);
+				} else {
+				    memcpy(stream_buf+stream_tail,transfer->buffer,(stream_size-stream_tail));
+				    memcpy(stream_buf,transfer->buffer+(stream_size-stream_tail),bytes_to_write-(stream_size-stream_tail));
+				};
+				__atomic_store_n(&stream_tail,(stream_tail+bytes_to_write)%stream_size,__ATOMIC_RELEASE);
+		    }
+#endif
+		    return 0;
 		} else {
-			return 0;
+			bytes_written = fwrite(transfer->buffer, 1, bytes_to_write, fd);
+			if ((bytes_written != bytes_to_write)
+				|| (limit_num_samples && (bytes_to_xfer == 0))) {
+				return -1;
+			} else {
+				return 0;
+			}
 		}
 	} else {
 		return -1;
@@ -367,11 +409,11 @@ int rx_callback(hackrf_transfer* transfer) {
 
 int tx_callback(hackrf_transfer* transfer) {
 	size_t bytes_to_read;
-	int i;
+	size_t bytes_read;
+	unsigned int i;
 
 	if( fd != NULL )
 	{
-		ssize_t bytes_read;
 		byte_count += transfer->valid_length;
 		bytes_to_read = transfer->valid_length;
 		if (limit_num_samples) {
@@ -385,15 +427,17 @@ int tx_callback(hackrf_transfer* transfer) {
 			bytes_to_xfer -= bytes_to_read;
 		}
 		bytes_read = fread(transfer->buffer, 1, bytes_to_read, fd);
-		if ((bytes_read != bytes_to_read)
-				|| (limit_num_samples && (bytes_to_xfer == 0))) {
+		if (limit_num_samples && (bytes_to_xfer == 0)) {
+                               return -1;
+		}
+		if (bytes_read != bytes_to_read) {
                        if (repeat) {
                                printf("Input file end reached. Rewind to beginning.\n");
                                rewind(fd);
                                fread(transfer->buffer + bytes_read, 1, bytes_to_read - bytes_read, fd);
 			       return 0;
                        } else {
-                               return -1; // not loopback mode, EOF
+                               return -1; /* not repeat mode, end of file */
                        }
 
 		} else {
@@ -426,8 +470,8 @@ int tx_callback(hackrf_transfer* transfer) {
 static void usage() {
 	printf("Usage:\n");
 	printf("\t[-d serial_number] # Serial number of desired HackRF.\n");
-	printf("\t-r <filename> # Receive data into file.\n");
-	printf("\t-t <filename> # Transmit data from file.\n");
+	printf("\t-r <filename> # Receive data into file (use '-' for stdout).\n");
+	printf("\t-t <filename> # Transmit data from file (use '-' for stdin).\n");
 	printf("\t-w # Receive data into file with WAV header and automatic name.\n");
 	printf("\t   # This is for SDR# compatibility and may not work with other software.\n");
 	printf("\t[-f freq_hz] # Frequency in Hz [%sMHz to %sMHz].\n",
@@ -448,9 +492,15 @@ static void usage() {
 	printf("\t[-s sample_rate_hz] # Sample rate in Hz (4/8/10/12.5/16/20MHz, default %sMHz).\n",
 		u64toa((DEFAULT_SAMPLE_RATE_HZ/FREQ_ONE_MHZ),&ascii_u64_data1));
 	printf("\t[-n num_samples] # Number of samples to transfer (default is unlimited).\n");
+#ifndef _WIN32
+/* The required atomic load/store functions aren't available when using C with MSVC */
+	printf("\t[-S buf_size] # Enable receive streaming with buffer size buf_size.\n");
+#endif
 	printf("\t[-c amplitude] # CW signal source mode, amplitude 0-127 (DC value to DAC).\n");
         printf("\t[-R] # Repeat TX mode (default is off) \n");
-	printf("\t[-b baseband_filter_bw_hz] # Set baseband filter bandwidth in Hz.\n\tPossible values: 1.75/2.5/3.5/5/5.5/6/7/8/9/10/12/14/15/20/24/28MHz, default < sample_rate_hz.\n" );
+	printf("\t[-b baseband_filter_bw_hz] # Set baseband filter bandwidth in Hz.\n\tPossible values: 1.75/2.5/3.5/5/5.5/6/7/8/9/10/12/14/15/20/24/28MHz, default <= 0.75 * sample_rate_hz.\n" );
+	printf("\t[-C ppm] # Set Internal crystal clock error in ppm.\n");
+	printf("\t[-H] # Synchronise USB transfer using GPIO pins.\n");
 }
 
 static hackrf_device* device = NULL;
@@ -494,11 +544,14 @@ int main(int argc, char** argv) {
 	float time_diff;
 	unsigned int lna_gain=8, vga_gain=20, txvga_gain=0;
   
-	while( (opt = getopt(argc, argv, "wr:t:f:i:o:m:a:p:s:n:b:l:g:x:c:d:R")) != EOF )
+	while( (opt = getopt(argc, argv, "Hwr:t:f:i:o:m:a:p:s:n:b:l:g:x:c:d:C:RS:")) != EOF )
 	{
 		result = HACKRF_SUCCESS;
 		switch( opt ) 
 		{
+		case 'H':
+			hw_sync = true;
+			break;
 		case 'w':
 			receive_wav = true;
 			break;
@@ -515,6 +568,11 @@ int main(int argc, char** argv) {
 
 		case 'd':
 			serial_number = optarg;
+			break;
+
+		case 'S':
+			result = parse_u64(optarg, &stream_size);
+			stream_buf = calloc(1,stream_size);
 			break;
 
 		case 'f':
@@ -609,28 +667,37 @@ int main(int argc, char** argv) {
                 case 'R':
                         repeat = true;
                         break;
+                      
+                case 'C':
+			crystal_correct = true;
+			result = parse_u32(optarg, &crystal_correct_ppm);
+			break;
+
+		case '?':
+			usage();
+			return EXIT_FAILURE;
 
 		default:
-			printf("unknown argument '-%c %s'\n", opt, optarg);
+			fprintf(stderr, "unknown argument '-%c %s'\n", opt, optarg);
 			usage();
 			return EXIT_FAILURE;
 		}
 		
 		if( result != HACKRF_SUCCESS ) {
-			printf("argument error: '-%c %s' %s (%d)\n", opt, optarg, hackrf_error_name(result), result);
+			fprintf(stderr, "argument error: '-%c %s' %s (%d)\n", opt, optarg, hackrf_error_name(result), result);
 			usage();
 			return EXIT_FAILURE;
 		}		
 	}
 
 	if (lna_gain % 8)
-		printf("warning: lna_gain (-l) must be a multiple of 8\n");
+		fprintf(stderr, "warning: lna_gain (-l) must be a multiple of 8\n");
 
 	if (vga_gain % 2)
-		printf("warning: vga_gain (-g) must be a multiple of 2\n");
+		fprintf(stderr, "warning: vga_gain (-g) must be a multiple of 2\n");
 
 	if (samples_to_xfer >= SAMPLES_TO_XFER_MAX) {
-		printf("argument error: num_samples must be less than %s/%sMio\n",
+		fprintf(stderr, "argument error: num_samples must be less than %s/%sMio\n",
 			u64toa(SAMPLES_TO_XFER_MAX,&ascii_u64_data1),
 			u64toa((SAMPLES_TO_XFER_MAX/FREQ_ONE_MHZ),&ascii_u64_data2));
 		usage();
@@ -640,41 +707,41 @@ int main(int argc, char** argv) {
 	if (if_freq || lo_freq || image_reject) {
 		/* explicit tuning selected */
 		if (!if_freq) {
-			printf("argument error: if_freq_hz must be specified for explicit tuning.\n");
+			fprintf(stderr, "argument error: if_freq_hz must be specified for explicit tuning.\n");
 			usage();
 			return EXIT_FAILURE;
 		}
 		if (!image_reject) {
-			printf("argument error: image_reject must be specified for explicit tuning.\n");
+			fprintf(stderr, "argument error: image_reject must be specified for explicit tuning.\n");
 			usage();
 			return EXIT_FAILURE;
 		}
 		if (!lo_freq && (image_reject_selection != RF_PATH_FILTER_BYPASS)) {
-			printf("argument error: lo_freq_hz must be specified for explicit tuning unless image_reject is set to bypass.\n");
+			fprintf(stderr, "argument error: lo_freq_hz must be specified for explicit tuning unless image_reject is set to bypass.\n");
 			usage();
 			return EXIT_FAILURE;
 		}
 		if ((if_freq_hz > IF_MAX_HZ) || (if_freq_hz < IF_MIN_HZ)) {
-			printf("argument error: if_freq_hz shall be between %s and %s.\n",
+			fprintf(stderr, "argument error: if_freq_hz shall be between %s and %s.\n",
 				u64toa(IF_MIN_HZ,&ascii_u64_data1),
 				u64toa(IF_MAX_HZ,&ascii_u64_data2));
 			usage();
 			return EXIT_FAILURE;
 		}
 		if ((lo_freq_hz > LO_MAX_HZ) || (lo_freq_hz < LO_MIN_HZ)) {
-			printf("argument error: lo_freq_hz shall be between %s and %s.\n",
+			fprintf(stderr, "argument error: lo_freq_hz shall be between %s and %s.\n",
 				u64toa(LO_MIN_HZ,&ascii_u64_data1),
 				u64toa(LO_MAX_HZ,&ascii_u64_data2));
 			usage();
 			return EXIT_FAILURE;
 		}
 		if (image_reject_selection > 2) {
-			printf("argument error: image_reject must be 0, 1, or 2 .\n");
+			fprintf(stderr, "argument error: image_reject must be 0, 1, or 2 .\n");
 			usage();
 			return EXIT_FAILURE;
 		}
 		if (automatic_tuning) {
-			printf("warning: freq_hz ignored by explicit tuning selection.\n");
+			fprintf(stderr, "warning: freq_hz ignored by explicit tuning selection.\n");
 			automatic_tuning = false;
 		}
 		switch (image_reject_selection) {
@@ -682,7 +749,7 @@ int main(int argc, char** argv) {
 			freq_hz = if_freq_hz;
 			break;
 		case RF_PATH_FILTER_LOW_PASS:
-			freq_hz = abs(if_freq_hz - lo_freq_hz);
+			freq_hz = labs(if_freq_hz - lo_freq_hz);
 			break;
 		case RF_PATH_FILTER_HIGH_PASS:
 			freq_hz = if_freq_hz + lo_freq_hz;
@@ -691,13 +758,13 @@ int main(int argc, char** argv) {
 			freq_hz = DEFAULT_FREQ_HZ;
 			break;
 		}
-		printf("explicit tuning specified for %s Hz.\n",
+		fprintf(stderr, "explicit tuning specified for %s Hz.\n",
 			u64toa(freq_hz,&ascii_u64_data1));
 
 	} else if (automatic_tuning) {
-		if( (freq_hz > FREQ_MAX_HZ) || (freq_hz < FREQ_MIN_HZ) )
+		if(freq_hz > FREQ_MAX_HZ)
 		{
-			printf("argument error: freq_hz shall be between %s and %s.\n",
+			fprintf(stderr, "argument error: freq_hz shall be between %s and %s.\n",
 				u64toa(FREQ_MIN_HZ,&ascii_u64_data1),
 				u64toa(FREQ_MAX_HZ,&ascii_u64_data2));
 			usage();
@@ -712,7 +779,7 @@ int main(int argc, char** argv) {
 	if( amp ) {
 		if( amp_enable > 1 )
 		{
-			printf("argument error: amp_enable shall be 0 or 1.\n");
+			fprintf(stderr, "argument error: amp_enable shall be 0 or 1.\n");
 			usage();
 			return EXIT_FAILURE;
 		}
@@ -720,7 +787,7 @@ int main(int argc, char** argv) {
 
 	if (antenna) {
 		if (antenna_enable > 1) {
-			printf("argument error: antenna_enable shall be 0 or 1.\n");
+			fprintf(stderr, "argument error: antenna_enable shall be 0 or 1.\n");
 			usage();
 			return EXIT_FAILURE;
 		}
@@ -735,29 +802,25 @@ int main(int argc, char** argv) {
 	{
 		/* Compute nearest freq for bw filter */
 		baseband_filter_bw_hz = hackrf_compute_baseband_filter_bw(baseband_filter_bw_hz);
-	}else
-	{
-		/* Compute default value depending on sample rate */
-		baseband_filter_bw_hz = hackrf_compute_baseband_filter_bw_round_down_lt(sample_rate_hz);
-	}
 
-	if (baseband_filter_bw_hz > BASEBAND_FILTER_BW_MAX) {
-		printf("argument error: baseband_filter_bw_hz must be less or equal to %u Hz/%.03f MHz\n",
-				BASEBAND_FILTER_BW_MAX, (float)(BASEBAND_FILTER_BW_MAX/FREQ_ONE_MHZ));
-		usage();
-		return EXIT_FAILURE;
-	}
+		if (baseband_filter_bw_hz > BASEBAND_FILTER_BW_MAX) {
+			fprintf(stderr, "argument error: baseband_filter_bw_hz must be less or equal to %u Hz/%.03f MHz\n",
+					BASEBAND_FILTER_BW_MAX, (float)(BASEBAND_FILTER_BW_MAX/FREQ_ONE_MHZ));
+			usage();
+			return EXIT_FAILURE;
+		}
 
-	if (baseband_filter_bw_hz < BASEBAND_FILTER_BW_MIN) {
-		printf("argument error: baseband_filter_bw_hz must be greater or equal to %u Hz/%.03f MHz\n",
-				BASEBAND_FILTER_BW_MIN, (float)(BASEBAND_FILTER_BW_MIN/FREQ_ONE_MHZ));
-		usage();
-		return EXIT_FAILURE;
+		if (baseband_filter_bw_hz < BASEBAND_FILTER_BW_MIN) {
+			fprintf(stderr, "argument error: baseband_filter_bw_hz must be greater or equal to %u Hz/%.03f MHz\n",
+					BASEBAND_FILTER_BW_MIN, (float)(BASEBAND_FILTER_BW_MIN/FREQ_ONE_MHZ));
+			usage();
+			return EXIT_FAILURE;
+		}
 	}
 
 	if( (transmit == false) && (receive == receive_wav) )
 	{
-		printf("receive -r and receive_wav -w options are mutually exclusive\n");
+		fprintf(stderr, "receive -r and receive_wav -w options are mutually exclusive\n");
 		usage();
 		return EXIT_FAILURE;
 	}
@@ -768,10 +831,10 @@ int main(int argc, char** argv) {
 		{
 			if( transmit == true ) 
 			{
-				printf("receive -r and transmit -t options are mutually exclusive\n");
+				fprintf(stderr, "receive -r and transmit -t options are mutually exclusive\n");
 			} else
 			{
-				printf("specify either transmit -t or receive -r or receive_wav -w option\n");
+				fprintf(stderr, "specify either transmit -t or receive -r or receive_wav -w option\n");
 			}
 			usage();
 			return EXIT_FAILURE;
@@ -789,7 +852,7 @@ int main(int argc, char** argv) {
 	if (signalsource) {
 		transceiver_mode = TRANSCEIVER_MODE_SS;
 		if (amplitude >127) {
-			printf("argument error: amplitude shall be in between 0 and 128.\n");
+			fprintf(stderr, "argument error: amplitude shall be in between 0 and 128.\n");
 			usage();
 			return EXIT_FAILURE;
 		}
@@ -804,28 +867,36 @@ int main(int argc, char** argv) {
 		strftime(date_time, DATE_TIME_MAX_LEN, "%Y%m%d_%H%M%S", timeinfo);
 		snprintf(path_file, PATH_FILE_MAX_LEN, "HackRF_%sZ_%ukHz_IQ.wav", date_time, (uint32_t)(freq_hz/(1000ull)) );
 		path = path_file;
-		printf("Receive wav file: %s\n", path);
+		fprintf(stderr, "Receive wav file: %s\n", path);
 	}	
 
 	// In signal source mode, the PATH argument is neglected.
 	if (transceiver_mode != TRANSCEIVER_MODE_SS) {
 		if( path == NULL ) {
-			printf("specify a path to a file to transmit/receive\n");
+			fprintf(stderr, "specify a path to a file to transmit/receive\n");
 			usage();
 			return EXIT_FAILURE;
 		}
 	}
 
+	// Change the freq and sample rate to correct the crystal clock error.
+	if( crystal_correct ) {
+
+		sample_rate_hz = (uint32_t)((double)sample_rate_hz * (1000000 - crystal_correct_ppm)/1000000+0.5);
+		freq_hz = freq_hz * (1000000 - crystal_correct_ppm)/1000000;
+		
+	}
+
 	result = hackrf_init();
 	if( result != HACKRF_SUCCESS ) {
-		printf("hackrf_init() failed: %s (%d)\n", hackrf_error_name(result), result);
+		fprintf(stderr, "hackrf_init() failed: %s (%d)\n", hackrf_error_name(result), result);
 		usage();
 		return EXIT_FAILURE;
 	}
 	
 	result = hackrf_open_by_serial(serial_number, &device);
 	if( result != HACKRF_SUCCESS ) {
-		printf("hackrf_open() failed: %s (%d)\n", hackrf_error_name(result), result);
+		fprintf(stderr, "hackrf_open() failed: %s (%d)\n", hackrf_error_name(result), result);
 		usage();
 		return EXIT_FAILURE;
 	}
@@ -833,19 +904,27 @@ int main(int argc, char** argv) {
 	if (transceiver_mode != TRANSCEIVER_MODE_SS) {
 		if( transceiver_mode == TRANSCEIVER_MODE_RX )
 		{
-			fd = fopen(path, "wb");
+			if (strcmp(path, "-") == 0) {
+				fd = stdout;
+			} else {
+				fd = fopen(path, "wb");
+			}
 		} else {
-			fd = fopen(path, "rb");
+			if (strcmp(path, "-") == 0) {
+				fd = stdin;
+			} else {
+				fd = fopen(path, "rb");
+			}
 		}
 	
 		if( fd == NULL ) {
-			printf("Failed to open file: %s\n", path);
+			fprintf(stderr, "Failed to open file: %s\n", path);
 			return EXIT_FAILURE;
 		}
 		/* Change fd buffer to have bigger one to store or read data on/to HDD */
 		result = setvbuf(fd , NULL , _IOFBF , FD_BUFFER_SIZE);
 		if( result != 0 ) {
-			printf("setvbuf() failed: %d\n", result);
+			fprintf(stderr, "setvbuf() failed: %d\n", result);
 			usage();
 			return EXIT_FAILURE;
 		}
@@ -867,19 +946,30 @@ int main(int argc, char** argv) {
 	signal(SIGTERM, &sigint_callback_handler);
 	signal(SIGABRT, &sigint_callback_handler);
 #endif
-	printf("call hackrf_sample_rate_set(%u Hz/%.03f MHz)\n", sample_rate_hz,((float)sample_rate_hz/(float)FREQ_ONE_MHZ));
-	result = hackrf_set_sample_rate_manual(device, sample_rate_hz, 1);
+	fprintf(stderr, "call hackrf_set_sample_rate(%u Hz/%.03f MHz)\n", sample_rate_hz,((float)sample_rate_hz/(float)FREQ_ONE_MHZ));
+	result = hackrf_set_sample_rate(device, sample_rate_hz);
 	if( result != HACKRF_SUCCESS ) {
-		printf("hackrf_sample_rate_set() failed: %s (%d)\n", hackrf_error_name(result), result);
+		fprintf(stderr, "hackrf_set_sample_rate() failed: %s (%d)\n", hackrf_error_name(result), result);
 		usage();
 		return EXIT_FAILURE;
 	}
 
-	printf("call hackrf_baseband_filter_bandwidth_set(%d Hz/%.03f MHz)\n",
-			baseband_filter_bw_hz, ((float)baseband_filter_bw_hz/(float)FREQ_ONE_MHZ));
-	result = hackrf_set_baseband_filter_bandwidth(device, baseband_filter_bw_hz);
+	if( baseband_filter_bw ) {
+		fprintf(stderr, "call hackrf_baseband_filter_bandwidth_set(%d Hz/%.03f MHz)\n",
+				baseband_filter_bw_hz, ((float)baseband_filter_bw_hz/(float)FREQ_ONE_MHZ));
+		result = hackrf_set_baseband_filter_bandwidth(device, baseband_filter_bw_hz);
+		if( result != HACKRF_SUCCESS ) {
+			fprintf(stderr, "hackrf_baseband_filter_bandwidth_set() failed: %s (%d)\n", hackrf_error_name(result), result);
+			usage();
+			return EXIT_FAILURE;
+		}
+	}
+
+	fprintf(stderr, "call hackrf_set_hw_sync_mode(%d)\n",
+			hw_sync);
+	result = hackrf_set_hw_sync_mode(device, hw_sync ? HW_SYNC_MODE_ON : HW_SYNC_MODE_OFF);
 	if( result != HACKRF_SUCCESS ) {
-		printf("hackrf_baseband_filter_bandwidth_set() failed: %s (%d)\n", hackrf_error_name(result), result);
+		fprintf(stderr, "hackrf_set_hw_sync_mode() failed: %s (%d)\n", hackrf_error_name(result), result);
 		usage();
 		return EXIT_FAILURE;
 	}
@@ -893,29 +983,29 @@ int main(int argc, char** argv) {
 		result |= hackrf_start_tx(device, tx_callback, NULL);
 	}
 	if( result != HACKRF_SUCCESS ) {
-		printf("hackrf_start_?x() failed: %s (%d)\n", hackrf_error_name(result), result);
+		fprintf(stderr, "hackrf_start_?x() failed: %s (%d)\n", hackrf_error_name(result), result);
 		usage();
 		return EXIT_FAILURE;
 	}
 
 	if (automatic_tuning) {
-		printf("call hackrf_set_freq(%s Hz/%.03f MHz)\n",
+		fprintf(stderr, "call hackrf_set_freq(%s Hz/%.03f MHz)\n",
 			u64toa(freq_hz, &ascii_u64_data1),((double)freq_hz/(double)FREQ_ONE_MHZ) );
 		result = hackrf_set_freq(device, freq_hz);
 		if( result != HACKRF_SUCCESS ) {
-			printf("hackrf_set_freq() failed: %s (%d)\n", hackrf_error_name(result), result);
+			fprintf(stderr, "hackrf_set_freq() failed: %s (%d)\n", hackrf_error_name(result), result);
 			usage();
 			return EXIT_FAILURE;
 		}
 	} else {
-		printf("call hackrf_set_freq_explicit() with %s Hz IF, %s Hz LO, %s\n",
+		fprintf(stderr, "call hackrf_set_freq_explicit() with %s Hz IF, %s Hz LO, %s\n",
 				u64toa(if_freq_hz,&ascii_u64_data1),
 				u64toa(lo_freq_hz,&ascii_u64_data2),
 				hackrf_filter_path_name(image_reject_selection));
 		result = hackrf_set_freq_explicit(device, if_freq_hz, lo_freq_hz,
 				image_reject_selection);
 		if (result != HACKRF_SUCCESS) {
-			printf("hackrf_set_freq_explicit() failed: %s (%d)\n",
+			fprintf(stderr, "hackrf_set_freq_explicit() failed: %s (%d)\n",
 					hackrf_error_name(result), result);
 			usage();
 			return EXIT_FAILURE;
@@ -923,27 +1013,27 @@ int main(int argc, char** argv) {
 	}
 
 	if( amp ) {
-		printf("call hackrf_set_amp_enable(%u)\n", amp_enable);
+		fprintf(stderr, "call hackrf_set_amp_enable(%u)\n", amp_enable);
 		result = hackrf_set_amp_enable(device, (uint8_t)amp_enable);
 		if( result != HACKRF_SUCCESS ) {
-			printf("hackrf_set_amp_enable() failed: %s (%d)\n", hackrf_error_name(result), result);
+			fprintf(stderr, "hackrf_set_amp_enable() failed: %s (%d)\n", hackrf_error_name(result), result);
 			usage();
 			return EXIT_FAILURE;
 		}
 	}
 
 	if (antenna) {
-		printf("call hackrf_set_antenna_enable(%u)\n", antenna_enable);
+		fprintf(stderr, "call hackrf_set_antenna_enable(%u)\n", antenna_enable);
 		result = hackrf_set_antenna_enable(device, (uint8_t)antenna_enable);
 		if (result != HACKRF_SUCCESS) {
-			printf("hackrf_set_antenna_enable() failed: %s (%d)\n", hackrf_error_name(result), result);
+			fprintf(stderr, "hackrf_set_antenna_enable() failed: %s (%d)\n", hackrf_error_name(result), result);
 			usage();
 			return EXIT_FAILURE;
 		}
 	}
 
 	if( limit_num_samples ) {
-		printf("samples_to_xfer %s/%sMio\n",
+		fprintf(stderr, "samples_to_xfer %s/%sMio\n",
 		u64toa(samples_to_xfer,&ascii_u64_data1),
 		u64toa((samples_to_xfer/FREQ_ONE_MHZ),&ascii_u64_data2) );
 	}
@@ -951,45 +1041,70 @@ int main(int argc, char** argv) {
 	gettimeofday(&t_start, NULL);
 	gettimeofday(&time_start, NULL);
 
-	printf("Stop with Ctrl-C\n");
+	fprintf(stderr, "Stop with Ctrl-C\n");
 	while( (hackrf_is_streaming(device) == HACKRF_TRUE) &&
 			(do_exit == false) ) 
 	{
 		uint32_t byte_count_now;
 		struct timeval time_now;
 		float time_difference, rate;
-		sleep(1);
-		
-		gettimeofday(&time_now, NULL);
-		
-		byte_count_now = byte_count;
-		byte_count = 0;
-		
-		time_difference = TimevalDiff(&time_now, &time_start);
-		rate = (float)byte_count_now / time_difference;
-		printf("%4.1f MiB / %5.3f sec = %4.1f MiB/second\n",
-				(byte_count_now / 1e6f), time_difference, (rate / 1e6f) );
+		if (stream_size>0) {
+#ifndef _WIN32
+		    if(stream_head==stream_tail) {
+				usleep(10000); // queue empty
+		    } else {
+				ssize_t len;
+				ssize_t bytes_written;
+				uint32_t _st= __atomic_load_n(&stream_tail,__ATOMIC_ACQUIRE);
+				if(stream_head<_st)
+			    	len=_st-stream_head;
+				else
+			    	len=stream_size-stream_head;
+				bytes_written = fwrite(stream_buf+stream_head, 1, len, fd);
+				if (len != bytes_written) {
+					printf("write failed");
+					do_exit=true;
+				};
+				stream_head=(stream_head+len)%stream_size;
+		    }
+		    if(stream_drop>0) {
+				uint32_t drops= __atomic_exchange_n (&stream_drop,0,__ATOMIC_SEQ_CST);
+				printf("dropped frames: [%d]\n",drops);
+		    }
+#endif
+		} else {
+			sleep(1);
+			gettimeofday(&time_now, NULL);
+			
+			byte_count_now = byte_count;
+			byte_count = 0;
+			
+			time_difference = TimevalDiff(&time_now, &time_start);
+			rate = (float)byte_count_now / time_difference;
+			fprintf(stderr, "%4.1f MiB / %5.3f sec = %4.1f MiB/second\n",
+					(byte_count_now / 1e6f), time_difference, (rate / 1e6f) );
 
-		time_start = time_now;
+			time_start = time_now;
 
-		if (byte_count_now == 0) {
-			exit_code = EXIT_FAILURE;
-			printf("\nCouldn't transfer any bytes for one second.\n");
-			break;
+			if (byte_count_now == 0) {
+				exit_code = EXIT_FAILURE;
+				fprintf(stderr, "\nCouldn't transfer any bytes for one second.\n");
+				break;
+			}
 		}
 	}
 	
 	result = hackrf_is_streaming(device);	
 	if (do_exit)
 	{
-		printf("\nUser cancel, exiting...\n");
+		fprintf(stderr, "\nUser cancel, exiting...\n");
 	} else {
-		printf("\nExiting... hackrf_is_streaming() result: %s (%d)\n", hackrf_error_name(result), result);
+		fprintf(stderr, "\nExiting... hackrf_is_streaming() result: %s (%d)\n", hackrf_error_name(result), result);
 	}
 	
 	gettimeofday(&t_end, NULL);
 	time_diff = TimevalDiff(&t_end, &t_start);
-	printf("Total time: %5.5f s\n", time_diff);
+	fprintf(stderr, "Total time: %5.5f s\n", time_diff);
 	
 	if(device != NULL)
 	{
@@ -997,9 +1112,9 @@ int main(int argc, char** argv) {
 		{
 			result = hackrf_stop_rx(device);
 			if( result != HACKRF_SUCCESS ) {
-				printf("hackrf_stop_rx() failed: %s (%d)\n", hackrf_error_name(result), result);
+				fprintf(stderr, "hackrf_stop_rx() failed: %s (%d)\n", hackrf_error_name(result), result);
 			}else {
-				printf("hackrf_stop_rx() done\n");
+				fprintf(stderr, "hackrf_stop_rx() done\n");
 			}
 		}
 	
@@ -1007,22 +1122,22 @@ int main(int argc, char** argv) {
 		{
 			result = hackrf_stop_tx(device);
 			if( result != HACKRF_SUCCESS ) {
-				printf("hackrf_stop_tx() failed: %s (%d)\n", hackrf_error_name(result), result);
+				fprintf(stderr, "hackrf_stop_tx() failed: %s (%d)\n", hackrf_error_name(result), result);
 			}else {
-				printf("hackrf_stop_tx() done\n");
+				fprintf(stderr, "hackrf_stop_tx() done\n");
 			}
 		}
 		
 		result = hackrf_close(device);
 		if( result != HACKRF_SUCCESS ) 
 		{
-			printf("hackrf_close() failed: %s (%d)\n", hackrf_error_name(result), result);
+			fprintf(stderr, "hackrf_close() failed: %s (%d)\n", hackrf_error_name(result), result);
 		}else {
-			printf("hackrf_close() done\n");
+			fprintf(stderr, "hackrf_close() done\n");
 		}
 		
 		hackrf_exit();
-		printf("hackrf_exit() done\n");
+		fprintf(stderr, "hackrf_exit() done\n");
 	}
 		
 	if(fd != NULL)
@@ -1042,8 +1157,8 @@ int main(int argc, char** argv) {
 		}	
 		fclose(fd);
 		fd = NULL;
-		printf("fclose(fd) done\n");
+		fprintf(stderr, "fclose(fd) done\n");
 	}
-	printf("exit\n");
+	fprintf(stderr, "exit\n");
 	return exit_code;
 }
